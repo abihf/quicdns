@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ use hickory_proto::{
 use moka::future::Cache;
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::RootCertStore;
-use tokio::{net::UdpSocket, sync::RwLock};
+use tokio::{net::UdpSocket, sync::RwLock, time::timeout};
 use tracing::{error, info, warn};
 
 const BUFFER_SIZE: usize = 4096;
@@ -49,10 +49,7 @@ async fn main() -> Result<()> {
     };
 
     info!("Starting DNS-over-QUIC proxy on {}", bind_addr);
-    info!(
-        "Upstream server: {} ({})",
-        upstream_server, remote_addr
-    );
+    info!("Upstream server: {} ({})", upstream_server, remote_addr);
 
     // Create DNS proxy
     let proxy = DnsProxy::new(&bind_addr, upstream_server, remote_addr, debug_mode).await?;
@@ -167,20 +164,27 @@ impl DnsProxy {
             return;
         }
 
+
         if self.debug_mode {
             info!("Cache MISS for query from {}", src_addr);
         }
 
+        // Start timer for processing duration
+        let start_time = Instant::now();
+
         // Process query and send response (or SERVFAIL on error)
-        match self.process_query(&query_data).await {
-            Ok(response_buf) => {
+        match timeout(Duration::from_secs(5), self.process_query(&query_data)).await {
+            Ok(Ok(response_buf)) => {
                 if self.debug_mode {
+                    let duration = start_time.elapsed();
                     // Validate and log response in debug mode
                     match Message::from_vec(&response_buf) {
                         Ok(response) => {
                             info!(
-                                "Sending valid response to {}: {:?}",
-                                src_addr, response.answers()
+                                "Sending valid response to {} (took {:?}): {:?}",
+                                src_addr,
+                                duration,
+                                response.answers(),
                             );
                         }
                         Err(e) => {
@@ -199,8 +203,12 @@ impl DnsProxy {
                     error!("Failed to send response to client: {}", e);
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Error processing query: {}", e);
+                send_servfail_raw(&query_data, &self.socket, src_addr).await;
+            }
+            Err(_) => {
+                warn!("Query timeout after 5 seconds for {}", src_addr);
                 send_servfail_raw(&query_data, &self.socket, src_addr).await;
             }
         }
@@ -211,10 +219,13 @@ impl DnsProxy {
         let connection = self.manager.get_connection().await?;
 
         // Open a bidirectional stream for the DNS query
-        let (mut send, mut recv) = connection
+        let (mut send, recv) = connection
             .open_bi()
             .await
             .context("Failed to open bidirectional stream")?;
+
+        // Wrap recv in a guard that ensures stop() is called on drop
+        let mut recv = RecvStreamGuard::new(recv);
 
         // Send DNS query over QUIC (DoQ uses 2-byte length prefix)
         let len_prefix = (query_data.len() as u16).to_be_bytes();
@@ -241,6 +252,34 @@ impl DnsProxy {
             .context("Failed to read DNS response")?;
 
         Ok(response_buf)
+    }
+}
+
+struct RecvStreamGuard {
+    inner: Option<quinn::RecvStream>,
+}
+
+impl RecvStreamGuard {
+    fn new(recv: quinn::RecvStream) -> Self {
+        Self { inner: Some(recv) }
+    }
+
+    async fn read_exact(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
+        if let Some(ref mut recv) = self.inner {
+            recv.read_exact(buf)
+                .await
+                .context("Failed to read from recv stream")
+        } else {
+            Err(anyhow::anyhow!("recv stream already consumed"))
+        }
+    }
+}
+
+impl Drop for RecvStreamGuard {
+    fn drop(&mut self) {
+        if let Some(mut recv) = self.inner.take() {
+            let _ = recv.stop(0u32.into());
+        }
     }
 }
 
