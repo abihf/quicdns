@@ -6,7 +6,7 @@ Requires=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/quicdns
+ExecStart=@BIN_DIR@/quicdns
 Restart=on-failure
 RestartSec=5s
 
