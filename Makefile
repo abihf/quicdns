@@ -6,9 +6,11 @@ target/release/quicdns: src/main.rs Cargo.toml Cargo.lock
 
 build: target/release/quicdns
 
-install: build
+install-bin: build
 	install -m 755 target/release/quicdns /usr/local/bin/quicdns
+install-service: 
 	install -m 644 quicdns.service /usr/lib/systemd/system/quicdns.service
+install: install-bin install-service
 
 clean:
 	rm target/release/quicdns
