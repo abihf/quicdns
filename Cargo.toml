@@ -12,6 +12,7 @@ categories = ["network-programming"]
 anyhow = "1.0"
 bytes = "1.9"
 hickory-proto = "0.25.2"
+hickory-resolver = { version = "0.25.2" }
 moka = { version = "0.12", features = ["future"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

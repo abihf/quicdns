@@ -7,7 +7,12 @@ use std::{
 use anyhow::{Context, Result};
 use hickory_proto::{
     op::{Message, ResponseCode},
-    serialize::binary::BinEncodable,
+    serialize::binary::BinEncodable, xfer::Protocol,
+};
+use hickory_resolver::{
+    Resolver,
+    config::{NameServerConfig, NameServerConfigGroup, ResolverConfig},
+    name_server::TokioConnectionProvider,
 };
 use moka::future::Cache;
 use quinn::{ClientConfig, Connection, Endpoint};
@@ -24,35 +29,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
-    // Get configuration from environment variables
-    let upstream_server =
-        std::env::var("UPSTREAM_SERVER").unwrap_or_else(|_| "dns.adguard-dns.com".to_string());
-    let upstream_port: u16 = std::env::var("UPSTREAM_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(853);
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.53:53".to_string());
-    let debug_mode = std::env::var("DEBUG").map(|v| v == "1").unwrap_or(false);
-
-    // Resolve upstream server address
-    let remote_addr = if let Ok(upstream_ip) = std::env::var("UPSTREAM_IP") {
-        let ip: IpAddr = upstream_ip.parse().context("Invalid UPSTREAM_IP format")?;
-        SocketAddr::new(ip, upstream_port)
-    } else {
-        let server_addr = format!("{}:{}", upstream_server, upstream_port);
-        let addr = tokio::net::lookup_host(&server_addr)
-            .await
-            .context("Failed to resolve upstream server")?
-            .next()
-            .context("No addresses resolved for upstream server")?;
-        addr
-    };
-
-    info!("Starting DNS-over-QUIC proxy on {}", bind_addr);
-    info!("Upstream server: {} ({})", upstream_server, remote_addr);
-
     // Create DNS proxy
-    let proxy = DnsProxy::new(&bind_addr, upstream_server, remote_addr, debug_mode).await?;
+    let proxy = DnsProxy::new().await?;
     proxy.run().await;
     Ok(())
 }
@@ -65,21 +43,35 @@ struct DnsProxy {
 }
 
 impl DnsProxy {
-    async fn new(
-        bind_addr: &str,
-        server_name: String,
-        remote_addr: SocketAddr,
-        debug_mode: bool,
-    ) -> Result<Self> {
+    async fn new() -> Result<Self> {
+        // Get configuration from environment variables
+        let upstream_server =
+            std::env::var("UPSTREAM_SERVER").unwrap_or_else(|_| "dns.adguard-dns.com".to_string());
+        let upstream_port: u16 = std::env::var("UPSTREAM_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(853);
+        let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.53:53".to_string());
+        let debug_mode = std::env::var("DEBUG").map(|v| v == "1").unwrap_or(false);
+
         // Create UDP socket for receiving DNS queries
+        info!("Listening for DNS queries on {}", &bind_addr);
         let socket = UdpSocket::bind(bind_addr)
             .await
             .context("Failed to bind UDP socket")?;
 
-        info!("Listening for DNS queries on {}", bind_addr);
-
         // Create connection manager
-        let manager = ConnectionManager::new(remote_addr, server_name)?;
+        let mut manager = ConnectionManager::new(upstream_server, upstream_port)?;
+        if let Ok(upstream_ip) = std::env::var("UPSTREAM_IP") {
+            let ip: IpAddr = upstream_ip.parse().context("Invalid UPSTREAM_IP format")?;
+            manager = manager.with_server_ip(ip);
+        }
+        if let Ok(bootstrap_dns) = std::env::var("BOOTSTRAP_DNS") {
+            let addr: SocketAddr = bootstrap_dns
+                .parse()
+                .context("Invalid BOOTSTRAP_DNS format")?;
+            manager = manager.with_bootstrap_dns(addr);
+        }
         info!("Connection manager initialized");
 
         // Create DNS response cache
@@ -163,7 +155,6 @@ impl DnsProxy {
             }
             return;
         }
-
 
         if self.debug_mode {
             info!("Cache MISS for query from {}", src_addr);
@@ -285,13 +276,15 @@ impl Drop for RecvStreamGuard {
 
 struct ConnectionManager {
     endpoint: Endpoint,
-    remote_addr: SocketAddr,
     server_name: String,
+    server_ip: Option<IpAddr>,
+    server_port: u16,
+    bootstrap_dns: Option<SocketAddr>,
     connection: Arc<RwLock<Option<Connection>>>,
 }
 
 impl ConnectionManager {
-    fn new(remote_addr: SocketAddr, server_name: String) -> Result<Self> {
+    fn new(server_name: String, server_port: u16) -> Result<Self> {
         // Setup QUIC client configuration
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -311,10 +304,22 @@ impl ConnectionManager {
 
         Ok(Self {
             endpoint,
-            remote_addr,
             server_name,
+            server_ip: None,
+            server_port,
+            bootstrap_dns: None,
             connection: Arc::new(RwLock::new(None)),
         })
+    }
+
+    fn with_server_ip(mut self, ip: IpAddr) -> Self {
+        self.server_ip = Some(ip);
+        self
+    }
+
+    fn with_bootstrap_dns(mut self, addr: SocketAddr) -> Self {
+        self.bootstrap_dns = Some(addr);
+        self
     }
 
     async fn get_connection(&self) -> Result<Connection> {
@@ -342,11 +347,18 @@ impl ConnectionManager {
             }
         }
 
+        let remote_ip = if let Some(ip) = self.server_ip {
+            ip
+        } else {
+            resolve_upstream_addr(&self.server_name, self.bootstrap_dns).await?
+        };
+
+        let remote_addr = SocketAddr::new(remote_ip, self.server_port);
         // Establish new connection
-        info!("Establishing new QUIC connection to {}", self.remote_addr);
+        info!("Establishing new QUIC connection to {}", remote_addr);
         let connection = self
             .endpoint
-            .connect(self.remote_addr, &self.server_name)
+            .connect(remote_addr, &self.server_name)
             .context("Failed to initiate QUIC connection")?
             .await
             .context("Failed to establish QUIC connection")?;
@@ -355,6 +367,33 @@ impl ConnectionManager {
         *conn_guard = Some(connection.clone());
         Ok(connection)
     }
+}
+
+async fn resolve_upstream_addr(host: &str, bootstrap_dns: Option<SocketAddr>) -> Result<IpAddr> {
+    let server = bootstrap_dns.unwrap_or_else(|| "1.1.1.1:53".parse().unwrap());
+
+    let mut ns = NameServerConfigGroup::with_capacity(1);
+    ns.push(NameServerConfig::new(server, Protocol::Udp));
+
+    let resolver = Resolver::builder_with_config(
+        ResolverConfig::from_parts(None, vec![], ns),
+        TokioConnectionProvider::default(),
+    ).build();
+
+    let response = resolver
+        .lookup_ip(host)
+        .await
+        .context("can not resolve upstream ip")?;
+
+    for ip in response {
+        // Return the first IP address found
+        return Ok(ip);
+    }
+    Err(anyhow::anyhow!(
+        "No IP addresses found for {} with resolver {:?}",
+        host,
+        server
+    ))
 }
 
 async fn send_servfail(query: &Message, socket: &UdpSocket, src_addr: SocketAddr) {
