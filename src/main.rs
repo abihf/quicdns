@@ -295,9 +295,15 @@ impl ConnectionManager {
 
         client_crypto.alpn_protocols = vec![b"doq".to_vec()];
 
-        let client_config = ClientConfig::new(Arc::new(
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(15)));
+        transport.max_idle_timeout(Some(Duration::from_hours(1).try_into().unwrap()));
+
+
+        let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
         ));
+        client_config.transport_config(Arc::new(transport));
 
         let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
         endpoint.set_default_client_config(client_config);
@@ -359,7 +365,7 @@ impl ConnectionManager {
         let connection = self
             .endpoint
             .connect(remote_addr, &self.server_name)
-            .context("Failed to initiate QUIC connection")?
+            .context("Failed to initqiate QUIC connection")?
             .await
             .context("Failed to establish QUIC connection")?;
 
