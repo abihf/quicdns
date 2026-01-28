@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context, Result};
 use hickory_proto::{
     op::{Message, ResponseCode},
-    serialize::binary::BinEncodable, xfer::Protocol,
+    serialize::binary::BinEncodable,
+    xfer::Protocol,
 };
 use hickory_resolver::{
     Resolver,
@@ -112,6 +113,17 @@ impl DnsProxy {
         }
     }
 
+    async fn ensure_connection_background(&self) {
+        if self.manager.is_connected().await {
+            return;
+        }
+        
+        let manager = self.manager.clone(); // Clone the Arc
+        tokio::spawn(async move {
+            let _ = manager.get_connection().await;
+        });
+    }
+
     async fn handle_query(&self, query_data: Vec<u8>, src_addr: SocketAddr) {
         if self.debug_mode {
             // Parse query for debugging
@@ -159,6 +171,8 @@ impl DnsProxy {
         if self.debug_mode {
             info!("Cache MISS for query from {}", src_addr);
         }
+
+        self.ensure_connection_background().await;
 
         // Start timer for processing duration
         let start_time = Instant::now();
@@ -299,7 +313,6 @@ impl ConnectionManager {
         transport.keep_alive_interval(Some(Duration::from_secs(15)));
         transport.max_idle_timeout(Some(Duration::from_hours(1).try_into().unwrap()));
 
-
         let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
         ));
@@ -326,6 +339,15 @@ impl ConnectionManager {
     fn with_bootstrap_dns(mut self, addr: SocketAddr) -> Self {
         self.bootstrap_dns = Some(addr);
         self
+    }
+
+    async fn is_connected(&self) -> bool {
+        let conn_guard = self.connection.read().await;
+        if let Some(conn) = conn_guard.as_ref() {
+            conn.close_reason().is_none()
+        } else {
+            false
+        }
     }
 
     async fn get_connection(&self) -> Result<Connection> {
@@ -385,7 +407,8 @@ async fn resolve_upstream_addr(host: &str, bootstrap_dns: Option<SocketAddr>) ->
     let resolver = Resolver::builder_with_config(
         ResolverConfig::from_parts(None, vec![], ns),
         TokioConnectionProvider::default(),
-    ).build();
+    )
+    .build();
 
     let response = resolver
         .lookup_ip(host)
