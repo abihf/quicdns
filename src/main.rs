@@ -333,13 +333,14 @@ impl ConnectionManager {
         {
             let conn_guard = self.connection.read().await;
             if let Some(conn) = conn_guard.as_ref() {
-                if conn.close_reason().is_none() {
+                if let Some(reason) = conn.close_reason() {
+                    warn!(
+                        "Existing connection is closed, will reconnect. reason: {:?}",
+                        reason
+                    );
+                } else {
                     return Ok(conn.clone());
                 }
-                warn!(
-                    "Existing connection is closed, will reconnect. reason: {:?}",
-                    conn.close_reason()
-                );
             }
         }
 
