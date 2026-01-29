@@ -1,6 +1,9 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -41,6 +44,7 @@ struct DnsProxy {
     cache: Arc<Cache<Vec<u8>, Vec<u8>>>,
     socket: Arc<UdpSocket>,
     debug_mode: bool,
+    timeout_count: Arc<AtomicUsize>,
 }
 
 impl DnsProxy {
@@ -90,6 +94,7 @@ impl DnsProxy {
             cache: Arc::new(cache),
             socket: Arc::new(socket),
             debug_mode,
+            timeout_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -114,13 +119,13 @@ impl DnsProxy {
     }
 
     async fn ensure_connection_background(&self) {
-        if self.manager.is_connected().await {
+        if self.manager.is_connecting() || self.manager.is_connected().await {
             return;
         }
-        
+
         let manager = self.manager.clone(); // Clone the Arc
         tokio::spawn(async move {
-            let _ = manager.get_connection().await;
+            let _ = manager.connect(false).await;
         });
     }
 
@@ -180,6 +185,7 @@ impl DnsProxy {
         // Process query and send response (or SERVFAIL on error)
         match timeout(Duration::from_secs(5), self.process_query(&query_data)).await {
             Ok(Ok(response_buf)) => {
+                self.timeout_count.store(0, Ordering::Relaxed);
                 if self.debug_mode {
                     let duration = start_time.elapsed();
                     // Validate and log response in debug mode
@@ -209,12 +215,23 @@ impl DnsProxy {
                 }
             }
             Ok(Err(e)) => {
+                self.timeout_count.store(0, Ordering::Relaxed);
                 error!("Error processing query: {}", e);
                 send_servfail_raw(&query_data, &self.socket, src_addr).await;
             }
             Err(_) => {
                 warn!("Query timeout after 5 seconds for {}", src_addr);
                 send_servfail_raw(&query_data, &self.socket, src_addr).await;
+
+                let timeout_count = self.timeout_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if timeout_count > 5 {
+                    self.timeout_count.store(0, Ordering::Relaxed);
+                    warn!(
+                        "Timeout circuit breaker tripped after {} timeouts; reconnecting",
+                        timeout_count
+                    );
+                    self.manager.reconnect();
+                }
             }
         }
     }
@@ -295,6 +312,8 @@ struct ConnectionManager {
     server_port: u16,
     bootstrap_dns: Option<SocketAddr>,
     connection: Arc<RwLock<Option<Connection>>>,
+    force_reconnect: AtomicBool,
+    connecting: AtomicBool,
 }
 
 impl ConnectionManager {
@@ -328,6 +347,8 @@ impl ConnectionManager {
             server_port,
             bootstrap_dns: None,
             connection: Arc::new(RwLock::new(None)),
+            force_reconnect: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
         })
     }
 
@@ -341,6 +362,10 @@ impl ConnectionManager {
         self
     }
 
+    fn reconnect(&self) {
+        self.force_reconnect.store(true, Ordering::Relaxed);
+    }
+
     async fn is_connected(&self) -> bool {
         let conn_guard = self.connection.read().await;
         if let Some(conn) = conn_guard.as_ref() {
@@ -350,31 +375,45 @@ impl ConnectionManager {
         }
     }
 
+    fn is_connecting(&self) -> bool {
+        self.connecting.load(Ordering::Relaxed)
+    }
+
     async fn get_connection(&self) -> Result<Connection> {
+        if self.force_reconnect.swap(false, Ordering::Relaxed) {
+            // Forced reconnect requested
+            return self.connect(true).await;
+        }
         // Try to use existing connection
-        {
-            let conn_guard = self.connection.read().await;
-            if let Some(conn) = conn_guard.as_ref() {
-                if let Some(reason) = conn.close_reason() {
-                    warn!(
-                        "Existing connection is closed, will reconnect. reason: {:?}",
-                        reason
-                    );
-                } else {
-                    return Ok(conn.clone());
-                }
+
+        let conn_guard = self.connection.read().await;
+        if let Some(conn) = conn_guard.as_ref() {
+            if let Some(reason) = conn.close_reason() {
+                warn!(
+                    "Existing connection is closed, will reconnect. reason: {:?}",
+                    reason
+                );
+            } else {
+                return Ok(conn.clone());
             }
         }
+
+        return self.connect(false).await;
+    }
+
+    async fn connect(&self, force: bool) -> Result<Connection> {
+        self.connecting.store(true, Ordering::Relaxed);
 
         // Need to establish new connection
         let mut conn_guard = self.connection.write().await;
 
         // Double-check in case another task already reconnected
-        if let Some(conn) = conn_guard.as_ref() {
+        if !force && let Some(conn) = conn_guard.as_ref() {
             if conn.close_reason().is_none() {
                 return Ok(conn.clone());
             }
         }
+
 
         let remote_ip = if let Some(ip) = self.server_ip {
             ip
@@ -394,6 +433,7 @@ impl ConnectionManager {
 
         info!("Successfully connected to upstream DoQ server");
         *conn_guard = Some(connection.clone());
+        self.connecting.store(false, Ordering::Relaxed);
         Ok(connection)
     }
 }
