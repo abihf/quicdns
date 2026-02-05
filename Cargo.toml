@@ -10,14 +10,20 @@ categories = ["network-programming"]
 
 [dependencies]
 anyhow = "1.0"
-bytes = "1.9"
+bytes = "1.11.1"
 hickory-proto = "0.25.2"
 hickory-resolver = { version = "0.25.2" }
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12.13", features = ["future"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-tokio = { version = "1.41", features = ["rt-multi-thread", "net", "macros", "io-util", "sync"] }
+sd-notify = "0.4"
+tokio = { version = "1.41", features = [
+  "rt-multi-thread",
+  "net",
+  "macros",
+  "io-util",
+  "sync",
+] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-webpki-roots = "1.0.5"
-sd-notify = "0.4"
+webpki-roots = "1.0.6"

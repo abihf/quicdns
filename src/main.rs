@@ -421,7 +421,6 @@ impl ConnectionManager {
             }
         }
 
-
         let remote_ip = if let Some(ip) = self.server_ip {
             ip
         } else {
