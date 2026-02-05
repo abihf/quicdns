@@ -4,7 +4,7 @@ SERVICE_DIR=/usr/lib/systemd/system
 TARGET=
 
 target/release/quicdns: src/main.rs Cargo.toml Cargo.lock
-	RUSTFLAGS="-C target-cpu=native" cargo build --release
+	cargo build --release
 
 target/quicdns.service: quicdns.service.in
 	sed "s|@BIN_DIR@|$(BIN_DIR)|g" quicdns.service.in > target/quicdns.service

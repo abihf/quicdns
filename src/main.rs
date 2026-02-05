@@ -415,10 +415,8 @@ impl ConnectionManager {
         let mut conn_guard = self.connection.write().await;
 
         // Double-check in case another task already reconnected
-        if !force && let Some(conn) = conn_guard.as_ref() {
-            if conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
+        if !force && let Some(conn) = conn_guard.as_ref() && conn.close_reason().is_none() {
+            return Ok(conn.clone());
         }
 
         let remote_ip = if let Some(ip) = self.server_ip {
@@ -461,7 +459,7 @@ async fn resolve_upstream_addr(host: &str, bootstrap_dns: Option<SocketAddr>) ->
         .await
         .context("can not resolve upstream ip")?;
 
-    for ip in response {
+    if let Some(ip) = response.iter().next() {
         // Return the first IP address found
         return Ok(ip);
     }
