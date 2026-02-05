@@ -35,8 +35,15 @@ async fn main() -> Result<()> {
 
     // Create DNS proxy
     let proxy = DnsProxy::new().await?;
+    notify_systemd_ready();
     proxy.run().await;
     Ok(())
+}
+
+fn notify_systemd_ready() {
+    if let Err(err) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        warn!("Failed to notify systemd readiness: {}", err);
+    }
 }
 
 struct DnsProxy {

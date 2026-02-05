@@ -5,7 +5,8 @@ Wants=network-online.target
 Requires=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=@BIN_DIR@/quicdns
 Restart=on-failure
 RestartSec=5s
