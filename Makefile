@@ -25,6 +25,16 @@ clean:
 	rm target/release/quicdns
 	rm target/quicdns.service
 
+fmt:
+	cargo fmt --all
+
+lint:
+	cargo fmt --all -- --check
+	cargo clippy --all -- -D warnings
+
+check: lint
+	cargo check --all
+
 uninstall:
 	rm $(TARGET)$(BIN_DIR)/quicdns
 	rm $(TARGET)$(SERVICE_DIR)/quicdns.service

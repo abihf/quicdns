@@ -415,7 +415,10 @@ impl ConnectionManager {
         let mut conn_guard = self.connection.write().await;
 
         // Double-check in case another task already reconnected
-        if !force && let Some(conn) = conn_guard.as_ref() && conn.close_reason().is_none() {
+        if !force
+            && let Some(conn) = conn_guard.as_ref()
+            && conn.close_reason().is_none()
+        {
             return Ok(conn.clone());
         }
 
