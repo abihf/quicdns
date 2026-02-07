@@ -439,28 +439,43 @@ impl ConnectionManager {
 
         for remote_ip in remote_ips.clone() {
             let remote_addr = SocketAddr::new(remote_ip, self.server_port);
-            // Establish new connection
-            info!("Establishing new QUIC connection to {}", remote_addr);
-            if let Ok(connection) = self
-                .endpoint
-                .connect(remote_addr, &self.server_name)
-                .context("Failed to initqiate QUIC connection")?
-                .await
-            {
-                info!(
-                    "Successfully connected to upstream DoQ server at {}",
-                    remote_addr
-                );
-                *conn_guard = Some(connection.clone());
-                self.connecting.store(false, Ordering::Relaxed);
-                return Ok(connection);
+
+            match timeout(Duration::from_secs(5),  self.connect_to(remote_addr)).await {
+                Ok(Ok(connection)) => {
+                    info!("Connected to DoQ server at {}", remote_addr);
+                    *conn_guard = Some(connection.clone());
+                    self.connecting.store(false, Ordering::Relaxed);
+                    return Ok(connection);
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to connect to {}: {}", remote_addr, e);
+                }
+                Err(_) => {
+                    warn!("Connection attempt to {} timed out", remote_addr);
+                }
             }
         }
+
         self.connecting.store(false, Ordering::Relaxed);
         Err(anyhow::anyhow!(
             "Failed to connect to any resolved IP addresses: {:?}",
             remote_ips
         ))
+    }
+
+    async fn connect_to(&self, remote_addr: SocketAddr) -> Result<Connection> {
+        info!("Establishing new QUIC connection to {}", remote_addr);
+        let connection = self
+            .endpoint
+            .connect(remote_addr, &self.server_name)
+            .context("Failed to initiate QUIC connection")?
+            .await
+            .context("Failed to establish QUIC connection")?;
+        info!(
+            "Successfully connected to upstream DoQ server at {}",
+            remote_addr
+        );
+        Ok(connection)
     }
 }
 
