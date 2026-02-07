@@ -74,9 +74,18 @@ impl DnsProxy {
 
         // Create connection manager
         let mut manager = ConnectionManager::new(upstream_server, upstream_port)?;
-        if let Ok(upstream_ip) = std::env::var("UPSTREAM_IP") {
-            let ip: IpAddr = upstream_ip.parse().context("Invalid UPSTREAM_IP format")?;
-            manager = manager.with_server_ip(ip);
+        if let Ok(ips_string) = std::env::var("UPSTREAM_IP") {
+            let ips: Vec<IpAddr> = ips_string
+                .split(',')
+                .map(|raw_str| {
+                    let ip_str = raw_str.trim();
+                    ip_str
+                        .parse()
+                        .context(format!("can not parse IP address {}", ip_str))
+                        .unwrap()
+                })
+                .collect();
+            manager = manager.with_server_ip(ips);
         }
         if let Ok(bootstrap_dns) = std::env::var("BOOTSTRAP_DNS") {
             let addr: SocketAddr = bootstrap_dns
@@ -315,7 +324,7 @@ impl Drop for RecvStreamGuard {
 struct ConnectionManager {
     endpoint: Endpoint,
     server_name: String,
-    server_ip: Option<IpAddr>,
+    server_ip: Option<Vec<IpAddr>>,
     server_port: u16,
     bootstrap_dns: Option<SocketAddr>,
     connection: Arc<RwLock<Option<Connection>>>,
@@ -359,7 +368,7 @@ impl ConnectionManager {
         })
     }
 
-    fn with_server_ip(mut self, ip: IpAddr) -> Self {
+    fn with_server_ip(mut self, ip: Vec<IpAddr>) -> Self {
         self.server_ip = Some(ip);
         self
     }
@@ -422,30 +431,43 @@ impl ConnectionManager {
             return Ok(conn.clone());
         }
 
-        let remote_ip = if let Some(ip) = self.server_ip {
+        let remote_ips = if let Some(ip) = self.server_ip.clone() {
             ip
         } else {
             resolve_upstream_addr(&self.server_name, self.bootstrap_dns).await?
         };
 
-        let remote_addr = SocketAddr::new(remote_ip, self.server_port);
-        // Establish new connection
-        info!("Establishing new QUIC connection to {}", remote_addr);
-        let connection = self
-            .endpoint
-            .connect(remote_addr, &self.server_name)
-            .context("Failed to initqiate QUIC connection")?
-            .await
-            .context("Failed to establish QUIC connection")?;
-
-        info!("Successfully connected to upstream DoQ server");
-        *conn_guard = Some(connection.clone());
+        for remote_ip in remote_ips.clone() {
+            let remote_addr = SocketAddr::new(remote_ip, self.server_port);
+            // Establish new connection
+            info!("Establishing new QUIC connection to {}", remote_addr);
+            if let Ok(connection) = self
+                .endpoint
+                .connect(remote_addr, &self.server_name)
+                .context("Failed to initqiate QUIC connection")?
+                .await
+            {
+                info!(
+                    "Successfully connected to upstream DoQ server at {}",
+                    remote_addr
+                );
+                *conn_guard = Some(connection.clone());
+                self.connecting.store(false, Ordering::Relaxed);
+                return Ok(connection);
+            }
+        }
         self.connecting.store(false, Ordering::Relaxed);
-        Ok(connection)
+        Err(anyhow::anyhow!(
+            "Failed to connect to any resolved IP addresses: {:?}",
+            remote_ips
+        ))
     }
 }
 
-async fn resolve_upstream_addr(host: &str, bootstrap_dns: Option<SocketAddr>) -> Result<IpAddr> {
+async fn resolve_upstream_addr(
+    host: &str,
+    bootstrap_dns: Option<SocketAddr>,
+) -> Result<Vec<IpAddr>> {
     let server = bootstrap_dns.unwrap_or_else(|| "1.1.1.1:53".parse().unwrap());
 
     let mut ns = NameServerConfigGroup::with_capacity(1);
@@ -462,15 +484,16 @@ async fn resolve_upstream_addr(host: &str, bootstrap_dns: Option<SocketAddr>) ->
         .await
         .context("can not resolve upstream ip")?;
 
-    if let Some(ip) = response.iter().next() {
-        // Return the first IP address found
-        return Ok(ip);
+    let ips: Vec<IpAddr> = response.iter().collect();
+    if ips.is_empty() {
+        Err(anyhow::anyhow!(
+            "No IP addresses found for {} with resolver {:?}",
+            host,
+            server
+        ))
+    } else {
+        Ok(ips)
     }
-    Err(anyhow::anyhow!(
-        "No IP addresses found for {} with resolver {:?}",
-        host,
-        server
-    ))
 }
 
 async fn send_servfail(query: &Message, socket: &UdpSocket, src_addr: SocketAddr) {
