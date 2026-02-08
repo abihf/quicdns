@@ -20,6 +20,7 @@ use hickory_resolver::{
 };
 use moka::future::Cache;
 use quinn::{ClientConfig, Connection, Endpoint};
+use rustls::client::WebPkiServerVerifier;
 use tokio::{net::UdpSocket, sync::RwLock, time::timeout};
 use tracing::{error, info, warn};
 
@@ -335,17 +336,18 @@ struct ConnectionManager {
 
 impl ConnectionManager {
     fn new(server_name: String, server_port: u16) -> Result<Self> {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().expect("could not load platform certs")
-        {
-            roots.add(cert)?;
-        }
-        let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls_openssl::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let provider = Arc::new(rustls_openssl::default_provider());
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let roots = Arc::new(roots);
+        let verifier = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
+            .build()
+            .context("can not create webpki verifier")?;
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_webpki_verifier(verifier)
+            .with_no_client_auth();
 
         client_crypto.alpn_protocols = vec![b"doq".to_vec()];
 
