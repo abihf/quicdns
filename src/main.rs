@@ -20,7 +20,6 @@ use hickory_resolver::{
 };
 use moka::future::Cache;
 use quinn::{ClientConfig, Connection, Endpoint};
-use rustls::RootCertStore;
 use tokio::{net::UdpSocket, sync::RwLock, time::timeout};
 use tracing::{error, info, warn};
 
@@ -141,7 +140,9 @@ impl DnsProxy {
 
         let manager = self.manager.clone(); // Clone the Arc
         tokio::spawn(async move {
-            let _ = manager.connect(false).await;
+            let _ = manager
+                .connect(manager.force_reconnect.swap(false, Ordering::Relaxed))
+                .await;
         });
     }
 
@@ -334,13 +335,17 @@ struct ConnectionManager {
 
 impl ConnectionManager {
     fn new(server_name: String, server_port: u16) -> Result<Self> {
-        // Setup QUIC client configuration
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let mut client_crypto = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().expect("could not load platform certs")
+        {
+            roots.add(cert)?;
+        }
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls_openssl::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
 
         client_crypto.alpn_protocols = vec![b"doq".to_vec()];
 
@@ -440,7 +445,7 @@ impl ConnectionManager {
         for remote_ip in remote_ips.clone() {
             let remote_addr = SocketAddr::new(remote_ip, self.server_port);
 
-            match timeout(Duration::from_secs(5),  self.connect_to(remote_addr)).await {
+            match timeout(Duration::from_secs(5), self.connect_to(remote_addr)).await {
                 Ok(Ok(connection)) => {
                     info!("Connected to DoQ server at {}", remote_addr);
                     *conn_guard = Some(connection.clone());
