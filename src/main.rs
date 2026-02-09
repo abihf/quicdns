@@ -447,7 +447,7 @@ impl ConnectionManager {
         for remote_ip in remote_ips.clone() {
             let remote_addr = SocketAddr::new(remote_ip, self.server_port);
 
-            match timeout(Duration::from_secs(5), self.connect_to(remote_addr)).await {
+            match timeout(Duration::from_secs(3), self.connect_to(remote_addr)).await {
                 Ok(Ok(connection)) => {
                     info!("Connected to DoQ server at {}", remote_addr);
                     *conn_guard = Some(connection.clone());
@@ -478,6 +478,24 @@ impl ConnectionManager {
             .context("Failed to initiate QUIC connection")?
             .await
             .context("Failed to establish QUIC connection")?;
+
+        // Validate connection is open and functional
+        if let Some(close_reason) = connection.close_reason() {
+            return Err(anyhow::anyhow!(
+                "Connection closed immediately after establishment: {:?}",
+                close_reason
+            ));
+        }
+
+        {
+            // validate connection
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .context("Failed to open test stream on new connection")?;
+            let _ = send.finish()?;
+            let _ = recv.stop(0u32.into())?;
+        }
         info!(
             "Successfully connected to upstream DoQ server at {}",
             remote_addr
