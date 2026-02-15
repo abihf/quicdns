@@ -10,23 +10,27 @@ use std::{
 use anyhow::{Context, Result};
 use hickory_proto::{
     op::{Message, ResponseCode},
+    runtime::TokioRuntimeProvider,
     serialize::binary::BinEncodable,
     xfer::Protocol,
 };
 use hickory_resolver::{
     Resolver,
     config::{NameServerConfig, NameServerConfigGroup, ResolverConfig},
-    name_server::TokioConnectionProvider,
+    name_server::{GenericConnector, TokioConnectionProvider},
 };
 use moka::future::Cache;
+use once_cell::sync::OnceCell;
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::WebPkiServerVerifier;
 use tokio::{net::UdpSocket, sync::RwLock, time::timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const BUFFER_SIZE: usize = 4096;
 const CACHE_MAX_CAPACITY: u64 = 10000;
 const CACHE_TTL_SECS: u64 = 300; // 5 minutes
+
+static RESOLVER: OnceCell<Resolver<GenericConnector<TokioRuntimeProvider>>> = OnceCell::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,6 +56,7 @@ struct DnsProxy {
     socket: Arc<UdpSocket>,
     debug_mode: bool,
     timeout_count: Arc<AtomicUsize>,
+    force_reconnect: Arc<AtomicBool>,
 }
 
 impl DnsProxy {
@@ -111,6 +116,7 @@ impl DnsProxy {
             socket: Arc::new(socket),
             debug_mode,
             timeout_count: Arc::new(AtomicUsize::new(0)),
+            force_reconnect: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -135,15 +141,14 @@ impl DnsProxy {
     }
 
     async fn ensure_connection_background(&self) {
-        if self.manager.is_connecting() || self.manager.is_connected().await {
+        let force_reconnect = self.force_reconnect.swap(false, Ordering::Relaxed);
+        if !force_reconnect && (self.manager.is_connecting() || self.manager.is_connected().await) {
             return;
         }
 
         let manager = self.manager.clone(); // Clone the Arc
         tokio::spawn(async move {
-            let _ = manager
-                .connect(manager.force_reconnect.swap(false, Ordering::Relaxed))
-                .await;
+            let _ = manager.connect(true).await;
         });
     }
 
@@ -248,7 +253,9 @@ impl DnsProxy {
                         "Timeout circuit breaker tripped after {} timeouts; reconnecting",
                         timeout_count
                     );
-                    self.manager.reconnect();
+                    if !self.manager.is_connecting() {
+                        self.force_reconnect.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -330,7 +337,7 @@ struct ConnectionManager {
     server_port: u16,
     bootstrap_dns: Option<SocketAddr>,
     connection: Arc<RwLock<Option<Connection>>>,
-    force_reconnect: AtomicBool,
+    // force_reconnect: AtomicBool,
     connecting: AtomicBool,
 }
 
@@ -370,7 +377,7 @@ impl ConnectionManager {
             server_port,
             bootstrap_dns: None,
             connection: Arc::new(RwLock::new(None)),
-            force_reconnect: AtomicBool::new(false),
+            // force_reconnect: AtomicBool::new(false),
             connecting: AtomicBool::new(false),
         })
     }
@@ -385,9 +392,6 @@ impl ConnectionManager {
         self
     }
 
-    fn reconnect(&self) {
-        self.force_reconnect.store(true, Ordering::Relaxed);
-    }
 
     async fn is_connected(&self) -> bool {
         let conn_guard = self.connection.read().await;
@@ -403,10 +407,6 @@ impl ConnectionManager {
     }
 
     async fn get_connection(&self) -> Result<Connection> {
-        if self.force_reconnect.swap(false, Ordering::Relaxed) {
-            // Forced reconnect requested
-            return self.connect(true).await;
-        }
         // Try to use existing connection
 
         let conn_guard = self.connection.read().await;
@@ -420,7 +420,7 @@ impl ConnectionManager {
                 return Ok(conn.clone());
             }
         }
-
+        drop(conn_guard);
         return self.connect(false).await;
     }
 
@@ -509,15 +509,16 @@ async fn resolve_upstream_addr(
     bootstrap_dns: Option<SocketAddr>,
 ) -> Result<Vec<IpAddr>> {
     let server = bootstrap_dns.unwrap_or_else(|| "1.1.1.1:53".parse().unwrap());
+    let resolver = RESOLVER.get_or_init(move || {
+        let mut ns = NameServerConfigGroup::with_capacity(1);
+        ns.push(NameServerConfig::new(server, Protocol::Udp));
 
-    let mut ns = NameServerConfigGroup::with_capacity(1);
-    ns.push(NameServerConfig::new(server, Protocol::Udp));
-
-    let resolver = Resolver::builder_with_config(
-        ResolverConfig::from_parts(None, vec![], ns),
-        TokioConnectionProvider::default(),
-    )
-    .build();
+        Resolver::builder_with_config(
+            ResolverConfig::from_parts(None, vec![], ns),
+            TokioConnectionProvider::default(),
+        )
+        .build()
+    });
 
     let response = resolver
         .lookup_ip(host)
@@ -551,13 +552,13 @@ async fn send_servfail(query: &Message, socket: &UdpSocket, src_addr: SocketAddr
 
     match response.to_bytes() {
         Ok(response_bytes) => {
-            warn!("Sending SERVFAIL response to {}", src_addr);
+            debug!("Sending SERVFAIL response to {}", src_addr);
             if let Err(e) = socket.send_to(&response_bytes, src_addr).await {
-                error!("Failed to send SERVFAIL response: {}", e);
+                warn!("Failed to send SERVFAIL response: {}", e);
             }
         }
         Err(e) => {
-            error!("Failed to encode SERVFAIL response: {}", e);
+            warn!("Failed to encode SERVFAIL response: {}", e);
         }
     }
 }

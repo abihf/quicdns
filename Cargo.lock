@@ -762,6 +762,7 @@ dependencies = [
  "hickory-proto",
  "hickory-resolver",
  "moka",
+ "once_cell",
  "quinn",
  "rustls",
  "rustls-openssl",
