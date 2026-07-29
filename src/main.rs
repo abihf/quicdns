@@ -169,10 +169,7 @@ impl DnsProxy {
                             debug!("Received non-cacheable query from {}", src_addr);
                         }
 
-                        let in_flight = InFlightGuard::new(
-                            Arc::clone(&proxy.in_flight),
-                            Arc::clone(&proxy.in_flight_drained),
-                        );
+                        let in_flight = proxy.create_in_flight();
                         let query_data = Bytes::copy_from_slice(&buf[..len]);
                         let proxy = Arc::clone(&proxy);
                         tokio::spawn(async move {
@@ -198,6 +195,14 @@ impl DnsProxy {
         proxy.manager.shutdown();
         info!("DNS proxy stopped");
         Ok(())
+    }
+
+    #[inline(always)]
+    fn create_in_flight(&self) -> InFlightGuard {
+        InFlightGuard::new(
+            Arc::clone(&self.in_flight),
+            Arc::clone(&self.in_flight_drained),
+        )
     }
 
     async fn ensure_connection_background(&self) {
@@ -243,10 +248,7 @@ impl DnsProxy {
         match self.socket.try_send_to(&response, src_addr) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let in_flight = InFlightGuard::new(
-                    Arc::clone(&self.in_flight),
-                    Arc::clone(&self.in_flight_drained),
-                );
+                let in_flight = self.create_in_flight();
                 let socket = Arc::clone(&self.socket);
                 tokio::spawn(async move {
                     let _in_flight = in_flight;
