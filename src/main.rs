@@ -1,31 +1,27 @@
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use hickory_proto::{
-    op::{Message, MessageType, ResponseCode},
+    op::{Message, MessageType, OpCode, Query, ResponseCode},
+    rr::{Name, RData, RecordType},
     serialize::binary::BinEncodable,
 };
-use hickory_resolver::{
-    Resolver,
-    config::{ConnectionConfig, NameServerConfig, ResolverConfig},
-    net::runtime::TokioRuntimeProvider,
-};
 use moka::sync::Cache;
-use once_cell::sync::OnceCell;
-use quinn::{ClientConfig, Connection, Endpoint};
-use rustls::client::WebPkiServerVerifier;
+use openssl::{hash::MessageDigest, memcmp};
+use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig};
+use rustls::{client::WebPkiServerVerifier};
 use rustls_native_certs::load_native_certs;
 use std::{
     hint::cold_path,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
     vec,
 };
 use tokio::{
-    net::UdpSocket,
+    net::{UdpSocket, lookup_host},
     sync::{Notify, RwLock},
     time::timeout,
 };
@@ -34,7 +30,7 @@ use tracing::{debug, error, info, warn};
 const BUFFER_SIZE: usize = 4096;
 const CACHE_MAX_CAPACITY: u64 = 10000;
 
-static RESOLVER: OnceCell<Resolver<TokioRuntimeProvider>> = OnceCell::new();
+static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(0);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -74,7 +70,7 @@ impl DnsProxy {
         let debug_mode = std::env::var("DEBUG").map(|v| v == "1").unwrap_or(false);
 
         // Create connection manager
-        let mut manager = ConnectionManager::new(upstream_server, upstream_port)?;
+        let mut manager = ConnectionManager::new(upstream_server, upstream_port).await?;
         if let Ok(ips_string) = std::env::var("UPSTREAM_IP") {
             let addrs: Vec<SocketAddr> = ips_string
                 .split(',')
@@ -248,6 +244,7 @@ impl DnsProxy {
         match self.socket.try_send_to(&response, src_addr) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                warn!("UDP socket send buffer full; spawning task to send cached response");
                 let in_flight = self.create_in_flight();
                 let socket = Arc::clone(&self.socket);
                 tokio::spawn(async move {
@@ -362,7 +359,6 @@ impl DnsProxy {
             .await
             .context("Failed to open bidirectional stream")?;
 
-        // Wrap recv in a guard that ensures stop() is called on drop
         let mut recv = RecvStreamGuard::new(recv);
 
         // Send DNS query over QUIC (DoQ uses 2-byte length prefix)
@@ -460,7 +456,7 @@ struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    fn new(server_name: String, server_port: u16) -> Result<Self> {
+    async fn new(server_name: String, server_port: u16) -> Result<Self> {
         let provider = Arc::new(rustls_openssl::default_provider());
 
         let mut roots = rustls::RootCertStore::empty();
@@ -485,17 +481,21 @@ impl ConnectionManager {
         transport.max_idle_timeout(Some(Duration::from_hours(1).try_into().unwrap()));
 
         let mut client_config = ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
+            endpoint_config(),
         ));
         client_config.transport_config(Arc::new(transport));
 
-        let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+        let runtime = quinn::default_runtime().context("no default runtime")?;
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+            .context("Failed to bind UDP socket for QUIC endpoint")?;
+        let socket = runtime.wrap_udp_socket(socket)?;
+
+        let mut endpoint = Endpoint::new_with_abstract_socket(endpoint_config(), None, socket, runtime)?;
         endpoint.set_default_client_config(client_config);
 
         Ok(Self {
             endpoint,
             server_name,
-            // server_ip: None,
             server_port,
             bootstrap_dns: None,
             connection: Arc::new(RwLock::new(None)),
@@ -599,7 +599,6 @@ impl ConnectionManager {
             .await
             .context("Failed to establish QUIC connection")?;
 
-        // Validate connection is open and functional
         if let Some(close_reason) = connection.close_reason() {
             cold_path();
             return Err(anyhow::anyhow!(
@@ -609,7 +608,6 @@ impl ConnectionManager {
         }
 
         {
-            // validate connection
             let (mut send, mut recv) = connection
                 .open_bi()
                 .await
@@ -625,42 +623,225 @@ impl ConnectionManager {
     }
 
     async fn resolve_upstream_addr(&self) -> Result<Arc<Vec<SocketAddr>>> {
-        let server = self
-            .bootstrap_dns
-            .unwrap_or_else(|| "1.1.1.1:53".parse().unwrap());
-        let resolver = RESOLVER.get_or_try_init(move || {
-            let mut udp = ConnectionConfig::udp();
-            udp.port = server.port();
-            let ns = NameServerConfig::new(server.ip(), true, vec![udp]);
+        let ips = if let Some(server) = self.bootstrap_dns {
+            resolve_via_bootstrap_dns(&self.server_name, self.server_port, server).await?
+        } else {
+            lookup_host((self.server_name.as_str(), self.server_port))
+                .await
+                .context("can not resolve upstream ip")?
+                .collect()
+        };
 
-            Resolver::builder_with_config(
-                ResolverConfig::from_parts(None, vec![], vec![ns]),
-                TokioRuntimeProvider::default(),
-            )
-            .build()
-            .context("failed to build bootstrap resolver")
-        })?;
-
-        let response = resolver
-            .lookup_ip(&self.server_name)
-            .await
-            .context("can not resolve upstream ip")?;
-
-        let ips: Vec<SocketAddr> = response
-            .iter()
-            .map(|ip| SocketAddr::new(ip, self.server_port))
-            .collect();
         if ips.is_empty() {
             cold_path();
             Err(anyhow::anyhow!(
-                "No IP addresses found for {} with resolver {:?}",
+                "No IP addresses found for {}",
                 self.server_name,
-                server
             ))
         } else {
             Ok(Arc::new(ips))
         }
     }
+}
+
+struct CryptoConfig {}
+
+impl quinn::crypto::ClientConfig for CryptoConfig {
+    fn start_session(
+        self: Arc<Self>,
+        version: u32,
+        server_name: &str,
+        params: &TransportParameters,
+    ) -> std::prelude::v1::Result<Box<dyn quinn::crypto::Session>, quinn::ConnectError> {
+        todo!()
+    }
+}
+
+struct CryptoSession {}
+
+impl quinn::crypto::Session for CryptoSession {
+    fn initial_keys(&self, dst_cid: &quinn::ConnectionId, side: quinn::Side) -> quinn::crypto::Keys {
+        todo!()
+    }
+
+    fn handshake_data(&self) -> Option<Box<dyn std::any::Any>> {
+        todo!()
+    }
+
+    fn peer_identity(&self) -> Option<Box<dyn std::any::Any>> {
+        todo!()
+    }
+
+    fn early_crypto(&self) -> Option<(Box<dyn quinn::crypto::HeaderKey>, Box<dyn quinn::crypto::PacketKey>)> {
+        todo!()
+    }
+
+    fn early_data_accepted(&self) -> Option<bool> {
+        todo!()
+    }
+
+    fn is_handshaking(&self) -> bool {
+        todo!()
+    }
+
+    fn read_handshake(&mut self, buf: &[u8]) -> std::prelude::v1::Result<bool, TransportError> {
+        todo!()
+    }
+
+    fn transport_parameters(&self) -> std::prelude::v1::Result<Option<TransportParameters>, TransportError> {
+        todo!()
+    }
+
+    fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<quinn::crypto::Keys> {
+        todo!()
+    }
+
+    fn next_1rtt_keys(&mut self) -> Option<quinn::crypto::KeyPair<Box<dyn quinn::crypto::PacketKey>>> {
+        todo!()
+    }
+
+    fn is_valid_retry(&self, orig_dst_cid: &quinn::ConnectionId, header: &[u8], payload: &[u8]) -> bool {
+        todo!()
+    }
+
+    fn export_keying_material(
+        &self,
+        output: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> std::prelude::v1::Result<(), quinn::crypto::ExportKeyingMaterialError> {
+        todo!()
+    }
+}
+
+fn endpoint_config() -> EndpointConfig {
+    let mut buf = [0u8; 32]; 
+    openssl::rand::rand_bytes(&mut buf).expect("Failed to generate random HMAC key");
+    let key = openssl::pkey::PKey::hmac(&buf).expect("Failed to create hmac key");
+    EndpointConfig::new(Arc::new(Hmac256 { key }))
+}
+
+struct Hmac256 {
+    key: openssl::pkey::PKey<openssl::pkey::Private>,
+}
+
+impl quinn::crypto::HmacKey for Hmac256 {
+    fn sign(&self, data: &[u8], signature_out: &mut [u8]) {
+        let mut signer = openssl::sign::Signer::new(MessageDigest::sha256(), &self.key).expect("Failed to create signer");
+        signer.update(data).expect("Failed to update signer with data");
+        let _ = signer.sign(signature_out);
+    }
+
+    fn signature_len(&self) -> usize {
+        MessageDigest::sha256().size()
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> std::prelude::v1::Result<(), quinn::crypto::CryptoError> {
+        let mut expected = [0u8; 32];
+        self.sign(data, &mut expected);
+        if memcmp::eq(signature, &expected) {
+            Ok(())
+        } else {
+            Err(quinn::crypto::CryptoError{})
+        }
+    }
+}
+
+
+fn next_dns_query_id() -> u16 {
+    DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+}
+
+async fn resolve_via_bootstrap_dns(
+    server_name: &str,
+    server_port: u16,
+    bootstrap_server: SocketAddr,
+) -> Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+    for record_type in [RecordType::A, RecordType::AAAA] {
+        let resolved = resolve_bootstrap_record(
+            server_name,
+            server_port,
+            bootstrap_server,
+            record_type,
+        )
+        .await?;
+        addrs.extend(resolved);
+    }
+    Ok(addrs)
+}
+
+async fn resolve_bootstrap_record(
+    server_name: &str,
+    server_port: u16,
+    bootstrap_server: SocketAddr,
+    record_type: RecordType,
+) -> Result<Vec<SocketAddr>> {
+    let query_name = if server_name.ends_with('.') {
+        server_name.to_string()
+    } else {
+        format!("{server_name}.")
+    };
+
+    let mut query = Message::new(next_dns_query_id(), MessageType::Query, OpCode::Query);
+    query.metadata.recursion_desired = true;
+    query.add_query(Query::query(
+        Name::from_ascii(&query_name).context("invalid upstream server name")?,
+        record_type,
+    ));
+
+    let bind_addr = match bootstrap_server.ip() {
+        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .context("failed to bind bootstrap DNS socket")?;
+
+    let request = query.to_bytes().context("failed to encode bootstrap query")?;
+    socket
+        .send_to(&request, bootstrap_server)
+        .await
+        .context("failed to send bootstrap query")?;
+
+    let mut response_buf = [0_u8; BUFFER_SIZE];
+    let (response_len, response_from) = timeout(
+        Duration::from_secs(3),
+        socket.recv_from(&mut response_buf),
+    )
+    .await
+    .context("bootstrap query timed out")?
+    .context("failed to receive bootstrap response")?;
+
+    if response_from.ip() != bootstrap_server.ip() || response_from.port() != bootstrap_server.port() {
+        cold_path();
+        return Err(anyhow::anyhow!(
+            "bootstrap response came from unexpected server {}",
+            response_from
+        ));
+    }
+
+    let response = Message::from_vec(&response_buf[..response_len])
+        .context("failed to parse bootstrap response")?;
+
+    if response.metadata.response_code != ResponseCode::NoError {
+        cold_path();
+        return Err(anyhow::anyhow!(
+            "bootstrap response returned {:?}",
+            response.metadata.response_code
+        ));
+    }
+
+    let mut addrs = Vec::new();
+    for answer in &response.answers {
+        match &answer.data {
+            RData::A(ipv4) => addrs.push(SocketAddr::new(IpAddr::V4(ipv4.0), server_port)),
+            RData::AAAA(ipv6) => addrs.push(SocketAddr::new(IpAddr::V6(ipv6.0), server_port)),
+            _ => {}
+        }
+    }
+
+    Ok(addrs)
 }
 
 async fn shutdown_signal() -> Result<()> {
