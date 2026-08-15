@@ -248,6 +248,7 @@ impl DnsProxy {
         match self.socket.try_send_to(&response, src_addr) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                warn!("UDP socket send buffer full; spawning task to send cached response to {}", src_addr);
                 let in_flight = self.create_in_flight();
                 let socket = Arc::clone(&self.socket);
                 tokio::spawn(async move {
@@ -461,7 +462,7 @@ struct ConnectionManager {
 
 impl ConnectionManager {
     fn new(server_name: String, server_port: u16) -> Result<Self> {
-        let provider = Arc::new(rustls_openssl::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
 
         let mut roots = rustls::RootCertStore::empty();
         for cert in load_native_certs().expect("could not load CA certificates") {
